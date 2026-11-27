@@ -1,0 +1,1094 @@
+子组件：
+<template>
+  <div style="width:100%;height:100%">
+    <DocumentEditor
+      :id="id"
+      :document-server-url="serverUrl"
+      :config="mergedConfig"
+    />
+  </div>
+</template>
+
+<script setup>
+import { ref, computed, onUnmounted } from 'vue'
+import { DocumentEditor } from '@onlyoffice/document-editor-vue'
+
+const TAG = '[OO调试]'
+
+const props = defineProps({
+  id: { type: String, default: () => `onlyoffice-editor-${Date.now()}` },
+  serverUrl: { type: String, required: true },
+  config: {
+    type: Object,
+    required: true,
+    validator: (val) => !!(val.document?.url && val.document?.fileType && val.document?.key)
+  },
+  mode: { type: String, default: 'edit', validator: (v) => ['edit', 'view'].includes(v) },
+  lang: { type: String, default: 'zh-CN' }
+})
+
+const emit = defineEmits(['ready', 'error', 'request-close'])
+
+const isDirty = ref(false)
+const isReady = ref(false)
+const editorInstance = ref(null)
+
+let pendingSaveResolve = null
+let pendingSaveTimer = null
+
+// ===== 诊断①：直接监听编辑器 iframe 的 postMessage，确认编辑器到底有没有发事件 =====
+const onWindowMessage = (e) => {
+  const d = e.data
+  if (d && typeof d === 'object' && typeof d.type === 'string' && /^on[A-Z]/.test(d.type)) {
+    console.log(TAG, 'iframe 事件 =>', d.type, d)
+  }
+}
+window.addEventListener('message', onWindowMessage)
+
+const clearPendingSave = (result) => {
+  if (pendingSaveTimer) { clearTimeout(pendingSaveTimer); pendingSaveTimer = null }
+  if (pendingSaveResolve) {
+    const r = pendingSaveResolve
+    pendingSaveResolve = null
+    r(result)
+  }
+}
+
+function onReady() {
+  editorInstance.value = window.DocEditor?.instances?.[props.id] || null
+  isReady.value = true
+  isDirty.value = false
+  console.log(TAG, 'onDocumentReady 触发，实例=', editorInstance.value,
+    '可用方法=', editorInstance.value ? Object.keys(editorInstance.value) : null)
+  emit('ready')
+}
+
+function onStateChange(e) {
+  console.log(TAG, 'onDocumentStateChange 触发，payload=', e)
+  const changed = !!e?.data
+  if (changed) {
+    isDirty.value = true                        // Fast 模式下 latch：一旦改过就保持脏，直到主动保存
+  } else if (pendingSaveResolve) {
+    isDirty.value = false
+    clearPendingSave(true)
+  }
+  console.log(TAG, 'isDirty =', isDirty.value)
+}
+
+function onEditorError(err) {
+  console.error(TAG, 'onError =', err)
+  if (pendingSaveResolve) clearPendingSave(false)
+  emit('error', err)
+}
+
+function onRequestClose() {
+  console.log(TAG, 'onRequestClose 触发')
+  emit('request-close')
+}
+
+const events = {
+  onAppReady: () => console.log(TAG, 'onAppReady 触发'),
+  onDocumentReady: onReady,
+  onDocumentStateChange: onStateChange,
+  onError: onEditorError,
+  onRequestClose
+}
+
+const mergedConfig = computed(() => {
+  const cfg = {
+    ...props.config,
+    editorConfig: {
+      callbackUrl: "https://nygl/onlyOffice/callback",
+      lang: props.lang,
+      ...(props.mode === 'view' ? { mode: props.mode } : {}),
+      customization: {
+        ...props.config.editorConfig?.customization,
+        forcesave: true,
+        autosave: false
+      },
+      user: {
+        ...props.config.editorConfig?.user,
+        name: props.config.editorConfig?.user?.name || 'Anonymous'
+      }
+    },
+    events
+  }
+  // ===== 诊断②：确认交给封装库的配置里确实带了事件 =====
+  console.log(TAG, 'mergedConfig 生成，events=', Object.keys(cfg.events), 'mode=', props.mode, 'token=', !!cfg.token)
+  return cfg
+})
+
+function handleSave() {
+  const inst = editorInstance.value
+  if (!inst) return Promise.resolve(false)
+  if (!isDirty.value) return Promise.resolve(true)
+
+  return new Promise((resolve) => {
+    pendingSaveResolve = resolve
+    pendingSaveTimer = setTimeout(() => clearPendingSave(false), 10000)
+    try {
+      inst.forceSave()
+    } catch (e) {
+      console.error(TAG, 'forceSave 异常', e)
+      clearPendingSave(false)
+    }
+  })
+}
+
+// 路线B（Strict 模式）使用：触发编辑器原生未保存确认框
+function requestClose() {
+  const inst = editorInstance.value || window.DocEditor?.instances?.[props.id]
+  console.log(TAG, 'requestClose 调用，实例=', inst)
+  if (inst && typeof inst.requestClose === 'function') {
+    inst.requestClose()
+  } else {
+    emit('request-close')
+  }
+}
+
+onUnmounted(() => {
+  window.removeEventListener('message', onWindowMessage)
+  clearPendingSave(false)
+  try { editorInstance.value?.destroyEditor?.() } catch {}
+  if (window.DocEditor?.instances) window.DocEditor.instances[props.id] = undefined
+  editorInstance.value = null
+})
+
+defineExpose({
+  isDirty,
+  isReady,
+  getIsDirty: () => isDirty.value,
+  save: handleSave,
+  requestClose
+})
+</script>
+
+
+
+父组件：
+<template>
+  <div class="p-2">
+    <transition :enter-active-class="proxy?.animate.searchAnimate.enter" :leave-active-class="proxy?.animate.searchAnimate.leave">
+      <div v-show="showSearch" class="mb-[10px]">
+        <el-card shadow="hover">
+          <el-form ref="queryFormRef" :model="queryParams" :inline="true">
+            <el-form-item label="报表类别" prop="reportFormId">
+              <el-select v-model="queryParams.reportFormId" clearable disabled>
+                <el-option v-for="dict in attachment_type" :key="dict.value" :label="dict.label" :value="dict.value" />
+              </el-select>
+            </el-form-item>
+            <!--            <el-form-item label="单位" prop="createDeptName">-->
+            <!--              <el-select v-model="queryParams.createDeptName" placeholder="单位" clearable>-->
+            <!--                <el-option v-for="dict in branchDict" :key="dict.value" :label="dict.label" :value="dict.label" />-->
+            <!--              </el-select>-->
+            <!--            </el-form-item>-->
+            <el-form-item label="年度" prop="period">
+              <el-date-picker
+                v-model="queryParams.period"
+                type="year"
+                placeholder="请选择年度"
+                format="YYYY"
+                value-format="YYYY"
+                clearable
+              />
+            </el-form-item>
+            <el-form-item label="审批情况" prop="status">
+              <el-select v-model="queryParams.status" placeholder="请选择审批状态" clearable @change="handleStatusChange" @clear="handleStatusClear">
+                <el-option v-for="dict in audit_status" :key="dict.value" :label="dict.label" :value="dict.value" />
+              </el-select>
+            </el-form-item>
+            <!--            <el-form-item label="日期" prop="time_period">-->
+            <!--              <el-date-picker-->
+            <!--                v-model="queryParams.time_period"-->
+            <!--                type="monthrange"-->
+            <!--                unlink-panels-->
+            <!--                range-separator="至"-->
+            <!--                start-placeholder="开始月份"-->
+            <!--                end-placeholder="结束月份"-->
+            <!--                :shortcuts="shortcuts"-->
+            <!--              />-->
+            <!--            </el-form-item>-->
+            <!--            <el-form-item label="创建时间" style="width: 308px">-->
+            <!--              <el-date-picker-->
+            <!--                v-model="dateRange"-->
+            <!--                value-format="YYYY-MM-DD HH:mm:ss"-->
+            <!--                type="daterange"-->
+            <!--                range-separator="-"-->
+            <!--                start-placeholder="开始日期"-->
+            <!--                end-placeholder="结束日期"-->
+            <!--                :default-time="[new Date(2000, 1, 1, 0, 0, 0), new Date(2000, 1, 1, 23, 59, 59)]"-->
+            <!--              ></el-date-picker>-->
+            <!--            </el-form-item>-->
+            <!--            <el-form-item label="日期" prop="time_period" style="width: 308px">-->
+            <!--              <el-date-picker-->
+            <!--                v-model="dateRange"-->
+            <!--                value-format="YYYY-MM"-->
+            <!--                type="monthrange"-->
+            <!--                range-separator="至"-->
+            <!--                start-placeholder="开始月份"-->
+            <!--                end-placeholder="结束月份"-->
+            <!--                :shortcuts="shortcuts"-->
+            <!--              ></el-date-picker>-->
+            <!--            </el-form-item>-->
+            <el-form-item>
+              <el-button type="primary" icon="Search" @click="handleQuery">搜索</el-button>
+              <el-button icon="Refresh" @click="resetQuery">重置</el-button>
+            </el-form-item>
+          </el-form>
+        </el-card>
+      </div>
+    </transition>
+    <el-card shadow="hover">
+      <template #header>
+        <el-row :gutter="10" class="mb8">
+          <el-col :span="1.5">
+            <el-button v-hasPermi="[VITE_APP_AUTH_PREFIX + 'jhgl_tbjh:add']" type="primary" plain icon="Plus" @click="handleAdd"
+            >填写计划</el-button
+            >
+          </el-col>
+          <!--          <el-col :span="1.5">-->
+          <!--            <el-button-->
+          <!--              v-hasPermi="[VITE_APP_AUTH_PREFIX + 'jhgl_tbjh:edit']"-->
+          <!--              type="success"-->
+          <!--              plain-->
+          <!--              icon="Edit"-->
+          <!--              :disabled="single"-->
+          <!--              @click="handleUpdate()"-->
+          <!--            >-->
+          <!--              修改-->
+          <!--            </el-button>-->
+          <!--          </el-col>-->
+          <el-col :span="1.5">
+            <el-button
+              v-hasPermi="[VITE_APP_AUTH_PREFIX + 'jhgl_tbjh:remove']"
+              type="danger"
+              plain
+              icon="Delete"
+              :disabled="multiple"
+              @click="handleDelete()"
+            >
+              删除计划
+            </el-button>
+          </el-col>
+          <!--          <el-col :span="1.5">-->
+          <!--            <el-button-->
+          <!--              v-hasPermi="[VITE_APP_AUTH_PREFIX + 'jhgl_tbjh:export']"-->
+          <!--              type="warning"-->
+          <!--              plain-->
+          <!--              icon="Download"-->
+          <!--              @click="handleExport"-->
+          <!--            >导出</el-button-->
+          <!--            >-->
+          <!--          </el-col>-->
+          <!--          <el-col :span="1.5">-->
+          <!--            <el-button-->
+          <!--              v-hasPermi="[VITE_APP_AUTH_PREFIX + 'jhgl_tbjh:remove']"-->
+          <!--              type="danger"-->
+          <!--              plain-->
+          <!--              icon="Refresh"-->
+          <!--              @click="handleRefreshCache"-->
+          <!--            >刷新缓存</el-button-->
+          <!--            >-->
+          <!--          </el-col>-->
+          <right-toolbar v-model:show-search="showSearch" @query-table="getList"></right-toolbar>
+        </el-row>
+      </template>
+
+      <el-table v-loading="loading" :data="reportList" @selection-change="handleSelectionChange">
+        <el-table-column type="selection" width="55" align="center" />
+        <el-table-column v-if="false" label="报表编号" align="center" prop="id" />
+        <!--        <el-table-column label="报表类别" align="center" prop="reportFormId" :show-overflow-tooltip="true" />-->
+        <el-table-column label="年度" align="center" prop="period" :show-overflow-tooltip="true" width="130" />
+<!--        <el-table-column label="年度" align="center" prop="period" width="130">-->
+<!--          <template #default="scope">-->
+<!--            <span>{{ String(scope.row.period).split('-')[0] }}</span>-->
+<!--          </template>-->
+<!--        </el-table-column>-->
+        <el-table-column label="报表类别" align="center" prop="reportFormId" width="120">
+          <template #default="scope">
+            <dict-tag :options="attachment_type" :value="scope.row.reportFormId" />
+          </template>
+        </el-table-column>
+        <el-table-column label="文件名称" align="center" prop="fileName" :show-overflow-tooltip="true" />
+        <!--        <el-table-column label="文件名" align="center" :show-overflow-tooltip="true">-->
+        <!--          <template #default="scope">-->
+        <!--            <router-link :to="'/system/dict-data/index/' + scope.row.dictId" class="link-type">-->
+        <!--              <span>{{ scope.row.dictType }}</span>-->
+        <!--            </router-link>-->
+        <!--          </template>-->
+        <!--        </el-table-column>-->
+        <el-table-column label="填报单位" align="center" prop="createDeptName" :show-overflow-tooltip="true" width="170" />
+        <el-table-column label="填报人" align="center" prop="createBy" :show-overflow-tooltip="true" width="130" />
+        <!--        <el-table-column label="创建时间" align="center" prop="createTime" width="180">-->
+        <!--          <template #default="scope">-->
+        <!--            <span>{{ proxy.parseTime(scope.row.createTime) }}</span>-->
+        <!--          </template>-->
+        <!--        </el-table-column>-->
+        <el-table-column label="状态" align="center" prop="status" width="180">
+          <template #default="scope">
+            <dict-tag :options="audit_status" :value="scope.row.status" />
+          </template>
+        </el-table-column>
+        <el-table-column label="审核人" align="center" prop="auditor" width="100" />
+        <el-table-column label="审核时间" align="center" prop="auditTime" width="180">
+          <template #default="scope">
+            <span>{{ proxy.parseTime(scope.row.auditTime) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" align="center" width="180" class-name="small-padding">
+          <template #default="scope">
+            <div class="table-operation-btns">
+              <el-button
+                v-hasPermi="[VITE_APP_AUTH_PREFIX + 'jhgl_tbjh:edit']"
+                round
+                size="small"
+                type="primary"
+                icon="Edit"
+                @click="handleUpdate(scope.row)"
+              >编辑</el-button>
+              <el-button v-if="scope.row.status === 0"
+                v-hasPermi="[VITE_APP_AUTH_PREFIX + 'jhgl_tbjh:submit']"
+                round
+                type="warning"
+                size="small"
+                icon="Upload"
+                @click="handleSubmit(scope.row)"
+              >上报</el-button>
+              <el-button v-if="scope.row.status === 0"
+                v-hasPermi="[VITE_APP_AUTH_PREFIX + 'jhgl_tbjh:remove']"
+                round
+                size="small"
+                type="danger"
+                icon="Delete"
+                @click="handleDelete(scope.row)"
+              >删除</el-button>
+              <el-button
+                v-hasPermi="[VITE_APP_AUTH_PREFIX + 'jhgl_tbjh:export']"
+                round
+                size="small"
+                type="info"
+                icon="Download"
+                @click="handleGenTable(scope.row)"
+              >导出</el-button>
+            </div>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <pagination v-show="total > 0" v-model:page="queryParams.pageNum" v-model:limit="queryParams.pageSize" :total="total" @pagination="getList" />
+    </el-card>
+
+    <!-- 添加或修改参数配置对话框 -->
+    <el-dialog v-model="dialog.visible" :title="dialog.title" width="500px" append-to-body>
+      <el-form ref="dictFormRef" :model="form" :rules="rules" label-width="80px">
+        <!--        <el-form-item label="字典名称" prop="dictName">-->
+        <!--          <el-input v-model="form.dictName" placeholder="请输入字典名称" />-->
+        <!--        </el-form-item>-->
+
+        <!--        <el-form-item label="文件类别" prop="dictName">-->
+        <!--          <el-select v-model="form.fileType" placeholder="请选择类别" clearable>-->
+        <!--            <el-option label="报表类" value="report" />-->
+        <!--            <el-option label="台账类" value="ledger" />-->
+        <!--          </el-select>-->
+        <!--        </el-form-item>-->
+
+        <el-form-item label="报表类别" prop="reportFormId">
+          <el-select v-model="form.reportFormId" filterable clearable disabled placeholder="请选择/输入报表">
+            <el-option v-for="dict in attachment_type" :key="dict.value" :label="dict.label" :value="dict.value" />
+          </el-select>
+        </el-form-item>
+        <!--        <el-form-item label="年份">-->
+        <!--          <el-select v-model="form.year" placeholder="请选择年份" clearable>-->
+        <!--            <el-option label="2025" value="2025" />-->
+        <!--            <el-option label="2026" value="2026" />-->
+        <!--          </el-select>-->
+        <!--        </el-form-item>-->
+
+        <el-form-item label="年度" prop="period">
+          <el-date-picker
+            v-model="form.period"
+            type="year"
+            placeholder="请选择年度"
+            format="YYYY"
+            value-format="YYYY"
+            clearable
+          />
+        </el-form-item>
+        <el-form-item label="填报单位" prop="createDeptName">
+          <el-input v-model="form.createDeptName" disabled />
+        </el-form-item>
+        <!--        <el-form-item label="字典类型" prop="dictType">-->
+        <!--          <el-input v-model="form.dictType" placeholder="请输入字典类型" />-->
+        <!--        </el-form-item>-->
+        <!--        <el-form-item label="备注" prop="remark">-->
+        <!--          <el-input v-model="form.remark" type="textarea" placeholder="请输入内容"></el-input>-->
+        <!--        </el-form-item>-->
+      </el-form>
+      <template #footer>
+        <div class="dialog-footer">
+          <!--          <el-button type="primary" @click="openEditDialog">编辑文档</el-button>-->
+          <!--          <el-button type="primary" @click="submitForm">确 定</el-button>-->
+          <el-button type="primary" @click="submitForm">编辑文档</el-button>
+          <el-button @click="cancel">取 消</el-button>
+        </div>
+      </template>
+    </el-dialog>
+
+    <!-- 文档编辑弹窗（官方编辑器放在这里） -->
+    <el-dialog
+      v-model="dialogVisible"
+      title="文档在线编辑"
+      width="95%"
+      top="0"
+      append-to-body
+      :close-on-click-modal="false"
+      destroy-on-close
+      :before-close="handleBeforeClose"
+    >
+      <div style="width:100%;height:750px">
+        <OnlyOfficeEditor
+          ref="editorRef"
+          :server-url="onlyOfficeServer"
+          :config="editorConfig"
+          :mode="mode"
+          @ready="onEditorReady"
+          @error="onEditorError"
+        />
+      </div>
+
+      <template #footer>
+        <el-button @click="handleClose" :disabled="isSaving">关闭</el-button>
+<!--        <el-button type="primary" @click="handleSave" :loading="isSaving" v-if="mode==='edit'">保存</el-button>-->
+      </template>
+    </el-dialog>
+  </div>
+</template>
+
+<script setup name="Dict" lang="ts">
+import { useDictStore } from '@/store/modules/dict';
+import { ReportForm, ReportQuery, ReportVO } from '@/api/tjgl/txbb/types';
+
+import { addReport, delReport, getReport, listReport, updateReport } from '@/api/tjgl/txbb'
+import { ref, reactive } from 'vue'
+import { getSystemUnit, getUserUnit } from "@/api/system/dept";
+
+import { ElMessage, ElMessageBox } from 'element-plus'
+import OnlyOfficeEditor from '@/components/OnlyOfficeEditor/index.vue'
+import { getOnlyOfficeConfig } from '@/api/onlyoffice'
+import { downloadFile } from "@/api/jgxm/xmjy";
+import dayjs from "dayjs";
+import { useUserStore } from "@/store/modules/user";
+import {getDBFieldList, insertDataByObject, selById, verifyReg} from "@/api/template";
+import {blobToFile, blobToUploadFile, sniffExt} from "@/utils/file";
+import {excelToJson} from "@/utils/excel/excelToJson";
+
+const userStore = useUserStore();
+
+// ===================== 配置项 =====================
+const onlyOfficeServer = import.meta.env.VITE_ONLYOFFICE_URL // 文档服务器地址
+
+const VITE_APP_AUTH_PREFIX = import.meta.env.VITE_APP_AUTH_PREFIX;
+
+const { proxy } = getCurrentInstance() as ComponentInternalInstance;
+
+// const { pfqk_list } = toRefs<any>(proxy?.useDict('pfqk_list'));
+const { audit_status } = toRefs<any>(proxy?.useDict('audit_status'));
+// const { tjgl_report } = toRefs<any>(proxy?.useDict('tjgl_report'));
+const { module_management } = toRefs<any>(proxy?.useDict('module_management'));
+const { attachment_type } = toRefs<any>(proxy?.useDict('attachment_type'));
+const branchDict = ref();
+
+const reportList = ref<ReportVO[]>([]);
+const loading = ref(true);
+const showSearch = ref(true);
+const ids = ref<Array<number | string>>([]);
+const single = ref(true);
+const multiple = ref(true);
+const total = ref(0);
+const dateRange = ref<[DateModelType, DateModelType]>(['', '']);
+
+const createDeptName = ref()
+const createDept = ref()
+// const hrefType = ref();
+const moduleKey = ref()
+const mode = ref('edit')
+
+const shortcuts = [
+  {
+    text: '本月',
+    value: [new Date(), new Date()],
+  },
+  {
+    text: '本年度',
+    value: () => {
+      const end = new Date()
+      const start = new Date(new Date().getFullYear(), 0)
+      return [start, end]
+    },
+  },
+  {
+    text: '最近6个月',
+    value: () => {
+      const end = new Date()
+      const start = new Date()
+      start.setMonth(start.getMonth() - 6)
+      return [start, end]
+    },
+  },
+]
+
+const dictFormRef = ref<ElFormInstance>();
+const queryFormRef = ref<ElFormInstance>();
+
+const dialog = reactive<DialogOption>({
+  visible: false,
+  title: ''
+});
+
+// ===================== 弹窗 & 文档编辑器 =====================
+const dialogVisible = ref(false)
+const editorRef = ref(null)
+const editorConfig = ref({})
+const isSaving = ref(false)
+
+const initFormData: ReportForm = {
+  id: undefined,
+  reportForm: '',
+  fileName: '',
+  reportFormId: undefined,
+  status: undefined,
+  createDept: undefined,
+  createDeptName: '',
+  period: '',
+  profileId: undefined,
+  auditor: '',
+  auditTime: '',
+  params: {
+    hrefType: undefined,
+    reportDataList: undefined,
+    pass: undefined
+  },
+  moduleType: undefined,
+  templateId: '',
+  tableId: '',
+  module: undefined, // 基础平台的模块ID
+  functionName: '' // 基础平台模块下的功能标识
+};
+const data = reactive<PageData<ReportForm, ReportQuery>>({
+  form: { ...initFormData },
+  queryParams: {
+    pageNum: 1,
+    pageSize: 10,
+    reportFormId: undefined,
+    reportFormIdList: undefined,
+    createDeptName: '',
+    period: '',
+    status: undefined,
+    statusList: undefined,
+    moduleType: undefined,
+    module: undefined, // 基础平台的模块ID
+    functionName: '' // 基础平台模块下的功能标识
+  },
+  rules: {
+    // reportFormId: [{ required: true, message: '报表类别不能为空', trigger: 'blur' }],
+    period: [{ required: true, message: '报表日期不能为空', trigger: 'blur' }]
+  }
+});
+
+const { queryParams, form, rules } = toRefs(data);
+
+// const editorConfig = ref({
+//   "document": {
+//     "title": "模板.xlsx",
+//     "fileType": "xlsx",
+//     "key": "2037462114971578369",
+//     "url": "http://10.190.168.110:9000/tlnygl/20260327/202603271729571.xlsx"
+//     // "permissions": {
+//     //   "edit": true,
+//     //   "download": true,
+//     //   "print": true,
+//     //   "review": true,
+//     //   "save": true
+//     // }
+//   },
+//   "editorConfig": {
+//     // "mode": "edit",
+//     "callbackUrl": "http://10.190.180.139/tlnygl/onlyOffice/callback",
+//     "user": {
+//       "name": "陈丽茵",
+//       "id": "ad4a0abd-49aa-4f72-b6da-db87220618df"
+//     }
+//   },
+//   "token": "eyJhbGciOiJIUzI1NiJ9.eyJlZGl0b3JDb25maWciOnsiY2FsbGJhY2tVcmwiOiJodHRwOi8vMTAuMTkwLjE4MC4xMzkvdGxueWdsL29ubHlPZmZpY2UvY2FsbGJhY2siLCJ1c2VyIjp7ImltYWdlIjoiaHR0cDovL250b2EubmFubi5jci8vbW50L250b2EvbnRvYV9wbGF0Zm9ybS91c2VyX3Bob3RvL2FkNGEwYWJkLTQ5YWEtNGY3Mi1iNmRhLWRiODcyMjA2MThkZi5qcGciLCJuYW1lIjoi6ZmI5Li96Iy1IiwiaWQiOiJhZDRhMGFiZC00OWFhLTRmNzItYjZkYS1kYjg3MjIwNjE4ZGYifX0sImRvY3VtZW50Ijp7InRpdGxlIjoi5qih5p2_Lnhsc3giLCJmaWxlVHlwZSI6Inhsc3giLCJrZXkiOiIyMDM3NDYyMTE0OTcxNTc4MzY5IiwidXJsIjoiaHR0cDovLzEwLjE5MC4xNjguMTEwOjkwMDAvdGxueWdsLzIwMjYwMzI3LzIwMjYwMzI3MTcyOTU3MS54bHN4In19.fei7OgaihyK7OBWJ6mmqYrFSetXG991vxLogf-P4_K4"
+// });
+
+
+// ===================== 1. 打开编辑弹窗 =====================
+const openEditDialog = async (profileId: number | string) => {
+  // dialog.visible = false;
+
+  // if(!row?.id) {
+  //   if (form.value.reportFormId === '' || form.value.period === '') {
+  //     ElMessage.warning('请选择完整条件')
+  //     return
+  //   }
+  // } else {
+  //
+  // }
+  if(profileId === '' || typeof profileId === undefined) {
+    ElMessage.error('文档加载出错！')
+    return
+  }
+
+
+  // 请求后端：传入参数 → 获取官方标准config
+  // const res = await getOnlyOfficeConfig(form)
+
+  // const res = await getOnlyOfficeConfig({profileId: "2037462114971578369"})
+  // if (res.code === 200) {
+  //   console.log("测试：", res.data)
+  //   editorConfig.value = res.data // 直接赋值官方配置
+  //   editorConfig.value.document.permissions.save = true
+  //   editorConfig.value.document.permissions.edit = true
+  //   dialogVisible.value = true
+  // }
+
+  // 请求后端：传入参数 → 获取官方标准config
+  const res = await getOnlyOfficeConfig({profileId: profileId})
+  // console.log("返回的配置信息：", res.data)
+  if (res.code === 200) {
+    editorConfig.value = res.data
+    dialogVisible.value = true // 打开文档编辑框
+  }
+}
+
+const init = async () => {
+  // 当前登录用户信息
+  const userInfo = await getUserUnit();
+  createDept.value = userInfo.data.branchInfo.BranchID
+  createDeptName.value = userInfo.data.branchInfo.BranchName;
+
+  // moduleKey.value = module_management.value.find(item => item.label === '统计管理')?.value;
+  // attachment_type.value = attachment_type.value.filter(item =>
+  //   ['能源消耗与节约', '分类'].includes(item.label)
+  // );
+
+  queryParams.value.reportFormId = attachment_type.value[0].value;
+
+  const units = await getSystemUnit();
+  // console.log("部门：", units.data);
+  branchDict.value = units.data.map(item => ({
+    label: item.BranchName, // 显示的文本
+    value: item.BranchID    // 选中时的值
+  }));
+  // console.log("部门字典：", branchDict.value);
+  // hrefType.value = attachment_type.value.find(item => item.label === '技改项目-项目建议书')?.value;
+};
+/** 查询字典类型列表 */
+// const getList = () => {
+//   loading.value = true;
+//   listReport(proxy?.addDateRange(queryParams.value, dateRange.value)).then((res) => {
+//     reportList.value = res.rows;
+//     total.value = res.total;
+//     loading.value = false;
+//   });
+// };
+/** 状态下拉框 */
+const handleStatusClear = (val) => {
+  queryParams.value.statusList = '';
+}
+const handleStatusChange = (val) => {
+  queryParams.value.statusList = val;
+}
+const getList = async () => {
+  loading.value = true;
+  // queryParams.value.period = String(queryParams.value.period)
+  queryParams.value.moduleType = moduleKey.value;
+  queryParams.value.reportFormIdList = attachment_type.value[0].value.toString();
+  queryParams.value.module = 'tlnygl_jhgl_tbjh';
+  queryParams.value.functionName = 'list';
+  const res = await listReport(proxy?.addDateRange(queryParams.value, dateRange.value));
+  reportList.value = res.rows;
+  total.value = res.total;
+  loading.value = false;
+};
+/** 取消按钮 */
+const cancel = () => {
+  reset();
+  dialog.visible = false;
+};
+/** 表单重置 */
+const reset = () => {
+  form.value = { ...initFormData };
+  dictFormRef.value?.resetFields();
+};
+/** 搜索按钮操作 */
+const handleQuery = () => {
+  queryParams.value.pageNum = 1;
+  getList();
+};
+/** 重置按钮操作 */
+const resetQuery = () => {
+  dateRange.value = ['', ''];
+  queryFormRef.value?.resetFields();
+  queryParams.value.statusList = undefined;
+  queryParams.value.reportFormId = attachment_type.value[0].value;
+  handleQuery();
+};
+/** 新增按钮操作 */
+const handleAdd = () => {
+  reset();
+  form.value.createDept = createDept.value;
+  form.value.createDeptName = createDeptName.value;
+  form.value.moduleType = moduleKey.value
+  // 确保数据已加载且不为空
+  if (attachment_type.value && attachment_type.value.length > 0) {
+    form.value.reportFormId = attachment_type.value[0].value;
+    form.value.reportForm = attachment_type.value[0].label
+  }
+  dialog.visible = true;
+  dialog.title = '新增提报';
+};
+/** 多选框选中数据 */
+const handleSelectionChange = (selection: ReportVO[]) => {
+  ids.value = selection.map((item) => item.id);
+  single.value = selection.length != 1;
+  multiple.value = !selection.length;
+};
+/** 提交 */
+const handleSubmit = async (row?: ReportVO) => {
+  if(row?.status === 2) {
+    ElMessage.warning('该报表已提报，不能重复提交！')
+    return
+  }
+  // reset();
+  // const id = row?.id || ids.value[0];
+  // const res = await getReport(id);
+  // Object.assign(form.value, res.data);
+  // //form.value.username = useUserStore().nickname;
+  // form.value.reportFormId = String(form.value.reportFormId);
+  // form.value.status = String(form.value.status);
+  // // form.value.auditDept = auditDept.value;
+  // form.value.auditor = userStore.nickname;
+  // form.value.auditTime = dayjs().format("YYYY-MM-DD HH:mm:ss");
+  //
+  // dialog.visible = true;
+  // dialog.title = '审批报表';
+  // //console.log("输出：", form.value.status)
+
+  row.status = 1;
+  Object.assign(form.value, row);
+  // form.value.params.reportDataList = arr;
+  await updateReport(form.value);
+
+  proxy?.$modal.msgSuccess('提报成功');
+  await getList();
+};
+/** 修改按钮操作 */
+const handleUpdate = async (row?: ReportVO) => {
+  // if(row?.status === 2) {
+  //   ElMessage.warning('已通过审核，不能编辑')
+  //   return
+  // }
+  // reset();
+  // const dictId = row?.id || ids.value[0];
+  // const res = await getReport(dictId);
+  // Object.assign(form.value, res.data);
+  // form.value.createDeptName = createDeptName.value;
+  // form.value.reportFormId = String(form.value.reportFormId)
+  // dialog.visible = true;
+  // dialog.title = '修改编辑';
+
+  if (row.status === 0 || row.status === 3) {
+    row.status = 0;
+  } else if (row.status === 1 || row.status === 2) {
+    mode.value = 'view';
+  }
+  await updateReport(row);
+  await getList();
+
+  await openEditDialog(row?.profileId) // 文档在线编辑
+};
+/** 提交按钮（新增） */
+const submitForm = () => {
+  dictFormRef.value?.validate(async (valid: boolean) => {
+    if (valid) {
+      // form.value.id ? await updateReport(form.value) : await addReport(form.value);
+      // proxy?.$modal.msgSuccess('操作成功');
+      // const profileId = await addReport(form.value);
+
+      try {
+        form.value.params.hrefType = form.value.reportFormId
+        const res = await addReport(form.value);
+        // console.log("返回的配置信息：", res.data)
+        if (res.code === 200) {
+          const profileId = res.data
+          // console.log("返回的profileId：", profileId)
+          proxy?.$modal.msgSuccess('新增成功');
+          dialog.visible = false;
+
+          await openEditDialog(profileId) // 文档在线编辑
+        }
+      } catch (error) {
+        // ElMessage.error(error.message)
+      } finally {
+        await getList();
+      }
+    }
+  });
+};
+/** 删除按钮操作 */
+const handleDelete = async (row?: ReportVO) => {
+  // const dictIds = row?.id || ids.value;
+  // await proxy?.$modal.confirm('是否确认删除编号为"' + dictIds + '"的数据项？');
+  // await delReport(dictIds);
+  // await getList();
+  // proxy?.$modal.msgSuccess('删除成功');
+
+  const planIds = row?.id ? [row.id] : ids.value; // 确保 row?.id 时转为数组
+  await proxy?.$modal.confirm('是否确认删除所选数据项？');
+  // 1. 筛选出勾选的数据
+  const filteredList = reportList.value.filter(item => {
+    return planIds.includes(item.id);
+  });
+  // 2. 使用 toRaw 去除 Proxy 包装，并保留所有字段
+  const plainList = filteredList.map(item => ({
+    ...toRaw(item)
+  }));
+  const hreTypeList = [];
+  const periodList = [];
+  const deptIdList = [];
+  const deptNameList = [];
+  plainList.forEach(item => {
+    hreTypeList.push(item.reportFormId.toString());
+    periodList.push(item.period);
+    deptIdList.push(item.createDept);
+    deptNameList.push(item.createDeptName);
+  });
+
+  const delData = {
+    ids: planIds,
+    hreType: hreTypeList, // row.reportFormId, hrefType
+    period: periodList, // plainList.map(item => item.period)
+    deptId: deptIdList,
+    deptName: deptNameList
+  }
+  await delReport(delData);
+  await getList();
+  proxy?.$modal.msgSuccess('删除成功');
+};
+/** 导出按钮操作 */
+const handleExport = () => {
+  proxy?.download(
+    'system/dict/type/export',
+    {
+      ...queryParams.value
+    },
+    `dict_${new Date().getTime()}.xlsx`
+  );
+};
+/** 导出表操作 */
+const handleGenTable = async (row?: ReportVO) => {
+  // const suggestIds = row?.id;
+  // console.log(suggestIds)
+  // if (suggestIds == '') {
+  //   proxy?.$modal.msgError('请选择要导出的数据');
+  //   return;
+  // }
+
+  try {
+    // 1. 获取文件流
+    const blob = await downloadFile(row?.profileId);
+    //const blob = new Blob([blobData], {type: 'application/zip'})
+
+    // 2. 触发浏览器下载
+    const url = URL.createObjectURL(blob);
+    // 前端手动创建<a>标签触发下载
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = row?.createDeptName + '_' + row?.period + '_' + row?.fileName + (await sniffExt(blob)); // 下载文件名
+    document.body.appendChild(a);
+    a.click();
+    URL.revokeObjectURL(url);
+    document.body.removeChild(a);
+
+    // 3. 成功提示
+    proxy?.$modal.msgSuccess('文件已成功下载');
+  } catch (err) {
+    proxy?.$modal.msgError('下载失败，请检查网络或服务端');
+    console.error(err);
+  }
+};
+/** 刷新缓存按钮操作 */
+// const handleRefreshCache = async () => {
+//   await refreshCache();
+//   proxy?.$modal.msgSuccess('刷新成功');
+//   useDictStore().cleanDict();
+// };
+
+let timer: any = null
+let finishInit = false // 初始化完成标记
+
+watch([module_management, attachment_type], ([modArr, attachmentArr]) => {
+  if (finishInit) return // 初始化完直接拦截，不再走任何逻辑
+
+  clearTimeout(timer)
+  timer = setTimeout(() => {
+    if (modArr?.length && attachmentArr?.length) {
+      moduleKey.value = module_management.value.find(item => item.label === '计划管理')?.value;
+      attachment_type.value = attachment_type.value.filter(item =>
+        item.value.startsWith(moduleKey.value) && ['年度节能计划'].includes(item.label)
+      );
+      init();
+      getList();
+      finishInit = true // 执行一次后永久上锁
+    }
+  }, 200)
+}, { immediate: true })
+
+onBeforeMount( () => {
+});
+onMounted(() => {
+});
+
+// 保存（✅ 核心：等待足够长，确保 callback 一定完成）
+const handleSave = async () => {
+  if (isSaving.value) return
+  isSaving.value = true
+  ElMessage.info('正在保存，请稍候...')
+
+  // 调用保存
+  editorRef.value.save()
+
+  // ✅ OnlyOffice 9.3.0 官方标准等待时间：至少 6 秒！
+  // 确保服务器100%完成callback
+  setTimeout(() => {
+    isSaving.value = false
+    ElMessage.success('保存成功')
+  }, 2500)
+
+  // const onForceSaveDone = (payload) => {
+  //   isSaving.value = false
+  //   if(payload.status === 6) {
+  //     ElMessage.success('保存成功')
+  //   } else {
+  //     ElMessage.error('保存异常 status：' + payload.status)
+  //   }
+  // }
+}
+
+// // 关闭
+// const handleClose = async () => {
+//   if (isSaving.value) {
+//     ElMessage.warning('正在保存，请不要关闭')
+//     return
+//   }
+//   try {
+//     // await ElMessageBox.confirm('确定关闭？')
+//     dialogVisible.value = false
+//     mode.value = 'edit'
+//   } catch {}
+// }
+//
+// // 关闭拦截
+// const handleBeforeClose = (done) => {
+//   if (isSaving.value) {
+//     ElMessage.warning('正在保存，请不要关闭')
+//     return
+//   }
+//   done()
+// }
+// X / ESC 拦截
+const handleBeforeClose = (done) => {
+  if (isSaving.value) { ElMessage.warning('正在保存，请不要关闭'); return }
+  confirmClose().then((canClose) => { if (canClose) done() })
+}
+
+// 底部「关闭」按钮
+const handleClose = async () => {
+  if (isSaving.value) { ElMessage.warning('正在保存，请不要关闭'); return }
+  const canClose = await confirmClose()
+  if (canClose) {
+    dialogVisible.value = false
+    mode.value = 'edit'
+  }
+}
+
+// Fast 模式：以宿主维护的脏标记为准
+const confirmClose = async () => {
+  const editor = editorRef.value
+  console.log('[关闭诊断] editorRef=', editor, 'isReady=', editor?.isReady, 'isDirty=', editor?.getIsDirty?.())
+
+  if (!editor || !editor.isReady) return true          // 编辑器还没加载完，不拦
+  if (!editor.getIsDirty()) return true                // 没改过，直接关
+
+  try {
+    await ElMessageBox.confirm(
+      '文档有未保存的更改，是否保存后再关闭？',
+      '提示',
+      {
+        confirmButtonText: '保存并关闭',
+        cancelButtonText: '不保存',
+        distinguishCancelAndClose: true,
+        type: 'warning'
+      }
+    )
+    isSaving.value = true
+    const ok = await editor.save()
+    isSaving.value = false
+    if (!ok) {
+      ElMessage.error('保存失败，请检查回调服务后重试')
+      return false
+    }
+    return true
+  } catch (action) {
+    return action === 'cancel'                         // 「不保存」放行；X/ESC 留下
+  }
+}
+
+const onEditorReady = () => {
+  ElMessage.success('文档加载成功')
+}
+
+const onEditorError = () => {
+  ElMessage.error('文档加载失败')
+}
+</script>
+<style scoped>
+/* 操作列按钮：每行2个，超出自动换行，等宽对齐 */
+.table-operation-btns {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr); /* 两列等宽 */
+  gap: 8px;                             /* 按钮间距 */
+  justify-items: center;   /* 按钮不拉伸，按固定宽度居中 */
+}
+
+.table-operation-btns :deep(.el-button) {
+  width: 70px;             /* 固定按钮宽度，想更小就调这个值 */
+  margin: 0 !important;  /* 覆盖 Element Plus 相邻按钮默认的 margin-left: 12px */
+  padding: 6px 0;        /* 收窄上下内边距，两行更紧凑，可按需调整 */
+}
+.demo-date-picker {
+  display: flex;
+  width: 100%;
+  padding: 0;
+  flex-wrap: wrap;
+}
+.demo-date-picker .block {
+  padding: 30px 0;
+  text-align: center;
+  border-right: solid 1px var(--el-border-color);
+  flex: 1;
+}
+.demo-date-picker .block:last-child {
+  border-right: none;
+}
+.demo-date-picker .demonstration {
+  display: block;
+  color: var(--el-text-color-secondary);
+  font-size: 14px;
+  margin-bottom: 20px;
+}
+
+</style>
+
